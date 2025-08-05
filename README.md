@@ -1,2 +1,3 @@
 # touch-world
-A spider for news all over the world.
+
+Communicate With Everything
