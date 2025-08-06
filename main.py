@@ -2,113 +2,155 @@ import machine
 import utime
 import binascii
 import rp2
+import array
 
-# Set UART Pin
-sensor_tx_pin_number = 4
-sensor_rx_pin_number = 5
-bluetooth_tx_pin_number = 0
-bluetooth_rx_pin_number = 1
+# Pin Configuration
+SENSOR_PINS = {"tx": 4, "rx": 5}
+BLUETOOTH_PINS = {"tx": 0, "rx": 1}
 
-sensor_tx_pin = machine.Pin(sensor_tx_pin_number)
-sensor_rx_pin = machine.Pin(sensor_rx_pin_number)
-bluetooth_tx_pin = machine.Pin(bluetooth_tx_pin_number)
-bluetooth_rx_pin = machine.Pin(bluetooth_rx_pin_number)
+# Anti-shake Parameters
+DISTANCE_THRESHOLD = 40
+SMOOTHING_FACTOR = 3
+POOL_SIZE = SMOOTHING_FACTOR
+MAX_DISTANCE = DISTANCE_THRESHOLD * SMOOTHING_FACTOR
 
-# HMMD-mmWave-Sensor Init
-soft_uart = machine.UART(1, baudrate=115200, tx=sensor_tx_pin, rx=sensor_rx_pin)
-# Bluetooth Moudle Init
-uart = machine.UART(0,baudrate=9600,bits=8,parity=None,stop=1,tx=bluetooth_tx_pin,rx=bluetooth_rx_pin)
+# LED Parameters
+LED_PIN = 16
+LED_STATE = {
+    0: (0, 0, 0),        # OFF - RGB black
+    1: (255, 255, 255)   # ON - RGB white
+}
 
-# ws2812_OnBoard init
-max_lum =100
-r=0
-g=0
-b=0
+# Initialize UARTs
+sensor_uart = machine.UART(
+    1, 
+    baudrate=115200,
+    tx=machine.Pin(SENSOR_PINS["tx"]),
+    rx=machine.Pin(SENSOR_PINS["rx"])
+)
 
-@rp2.asm_pio(sideset_init=rp2.PIO.OUT_LOW, out_shiftdir=rp2.PIO.SHIFT_LEFT, autopull=True, pull_thresh=24)
+bluetooth_uart = machine.UART(
+    0,
+    baudrate=9600,
+    bits=8,
+    parity=None,
+    stop=1,
+    tx=machine.Pin(BLUETOOTH_PINS["tx"]),
+    rx=machine.Pin(BLUETOOTH_PINS["rx"])
+)
+
+# Initialize NeoPixel LED
+@rp2.asm_pio(
+    sideset_init=rp2.PIO.OUT_LOW,
+    out_shiftdir=rp2.PIO.SHIFT_LEFT,
+    autopull=True,
+    pull_thresh=24
+)
 def ws2812():
-    T1 = 2
-    T2 = 5
-    T3 = 3
     wrap_target()
+    out(x, 1).side(0).delay(3-1)
+    jmp(not_x, "do_zero").side(1).delay(2-1)
+    jmp("bitloop").side(1).delay(5-1)
     label("bitloop")
-    out(x, 1)               .side(0)    [T3 - 1]
-    jmp(not_x, "do_zero")   .side(1)    [T1 - 1]
-    jmp("bitloop")          .side(1)    [T2 - 1]
     label("do_zero")
-    nop()                   .side(0)    [T2 - 1]
+    nop().side(0).delay(5-1)
     wrap()
 
-sm = rp2.StateMachine(0, ws2812, freq=8_000_000, sideset_base=machine.Pin(16))
+sm = rp2.StateMachine(
+    0, 
+    ws2812, 
+    freq=8_000_000, 
+    sideset_base=machine.Pin(LED_PIN)
+)
 sm.active(1)
 
-# Anti-shake algorithm
-distance = 20
-smart_ag = 5
-limit_average_distance = distance * smart_ag
-pool = []
-status_code = 0
-former_status_code = 0
+# Anti-shake state
+class SensorState:
+    def __init__(self):
+        self.pool = array.array('I', [0] * POOL_SIZE)
+        self.index = 0
+        self.pool_full = False
+        self.current_state = 0
+        self.previous_state = 0
 
-def anti_shake(raw_data):
-    global pool,status_code,former_status_code
-    sum = 0
-    pool.append(raw_data)
-    if len(pool) > smart_ag:
-        pool = pool[-smart_ag:]
-    for i in pool:
-        sum += i
-    if sum > limit_average_distance:
-        r,g,b = 0,0,0
-        rgb = (g << 24) | (r << 16) | (b << 8)
-        sm.put(rgb)
-        status_code = 0
-    else:
-        r,g,b = 255,255,255
-        rgb = (g << 24) | (r << 16) | (b << 8)
-        sm.put(rgb)
-        status_code = 1
-    if former_status_code != status_code:
-        if status_code == 1:
-            uart.write("Light ON!\n")
-        else:
-            uart.write("Light OFF!\n")
-    former_status_code = status_code
-        
-# Main Function
-def send_hex_string(hex_string):
-    hex_bytes = binascii.unhexlify(hex_string)
-    soft_uart.write(hex_bytes)
+sensor_state = SensorState()
+
+# LED Control Functions
+def set_led(state):
+    r, g, b = LED_STATE[state]
+    rgb = (g << 24) | (r << 16) | (b << 8)
+    sm.put(rgb)
+
+def update_bluetooth_state():
+    if sensor_state.current_state != sensor_state.previous_state:
+        message = "Light ON!\n" if sensor_state.current_state else "Light OFF!\n"
+        bluetooth_uart.write(message)
+        sensor_state.previous_state = sensor_state.current_state
+
+# Anti-shake Algorithm
+def process_distance(raw_distance):
+    # Update circular buffer
+    sensor_state.pool[sensor_state.index] = raw_distance
+    sensor_state.index = (sensor_state.index + 1) % POOL_SIZE
     
-def extract_number_manual(text):
-    text = str(text)
-    num_str = ""
-    for char in text:
-        if char.isdigit():  # 当前字符为数字
-            num_str += char
-        elif num_str:  # 遇到非数字且已有数字，结束提取
-            break
-    return int(num_str) if num_str else None
+    # Check if buffer is full
+    if not sensor_state.pool_full and sensor_state.index == 0:
+        sensor_state.pool_full = True
+    
+    # Calculate average if buffer full
+    total = 0
+    if sensor_state.pool_full:
+        for val in sensor_state.pool:
+            total += val
+    else:
+        total = sum(sensor_state.pool[:sensor_state.index])
+        count = sensor_state.index
+        total = total * POOL_SIZE / count if count else MAX_DISTANCE
+    
+    # Update state
+    sensor_state.current_state = 1 if total <= MAX_DISTANCE else 0
+    set_led(sensor_state.current_state)
+    update_bluetooth_state()
 
-def read_serial_data():
+# Serial Processing
+def extract_distance(data):
+    """Extracts first numeric value from byte data"""
+    num_str = bytearray()
+    for byte in data:
+        char = chr(byte)
+        if char.isdigit():
+            num_str.append(byte)
+        elif num_str:
+            break
+    return int(num_str.decode()) if num_str else None
+
+def read_sensor_data():
+    buffer = bytearray()
     while True:
-        utime.sleep_ms(40)
-        if soft_uart.any():
-            # 读取串口数据
-            data = soft_uart.readline()
-            data = extract_number_manual(data)
-            if data != None:
-                print(data)
-                anti_shake(data)
-                    
+        if sensor_uart.any():
+            buffer.extend(sensor_uart.read(sensor_uart.any()))
+            
+            # Process each line in buffer
+            while b'\n' in buffer:
+                line, _, buffer = buffer.partition(b'\n')
+                if line:
+                    yield line
+        
+        # Add small delay to prevent busy-waiting
+        utime.sleep_ms(5)
+
+# Main Application
+def main():
+    # Send configuration to sensor
+    config = binascii.unhexlify("FDFCFBFA0800120000006400000004030201")
+    sensor_uart.write(config)
+    
+    # Main processing loop
+    for data in read_sensor_data():
+        distance = extract_distance(data)
+        if distance is not None:
+            print(distance)
+            process_distance(distance)
 
 if __name__ == "__main__":
-    hex_to_send = "FDFCFBFA0800120000006400000004030201"
-    
-    send_hex_string(hex_to_send)
-    
-    response = read_serial_data()
-    
-
-
-
+    main()
