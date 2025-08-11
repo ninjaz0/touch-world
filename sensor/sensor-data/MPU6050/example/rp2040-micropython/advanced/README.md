@@ -185,6 +185,7 @@ import machine
 import utime
 import imu 
 import math
+import blancefilter
 import q4
 
 i2c = machine.I2C(0, sda=machine.Pin(0), scl=machine.Pin(1), freq=400000)
